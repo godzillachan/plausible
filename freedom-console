@@ -1,0 +1,162 @@
+#!/usr/bin/env python3
+import argparse
+import cmd2
+import math
+import os
+import random
+import rich.console
+import sh
+import uuid
+from sh import rm, dd, df, losetup, mdadm, mkfs, mkdir, rmdir, mount, umount, curl, tar, cryptsetup
+
+ONE_GIBIBYTE=1073741824
+ONE_MEBIBYTE=1048576
+DEFAULT_OFFSET_MAX_SECTORS=(ONE_GIBIBYTE*2)/512
+
+rich_console = rich.console.Console()
+
+class encrypted_device:
+    def __init__(self):
+        super().__init__()
+        self.loop_devices = []
+        self.safe_zone_content_url="https://cdn.kernel.org/pub/linux/kernel/v3.x/linux-3.19.8.tar.xz"
+
+    def attach_backing_file(self, page_root, description, total_size, block_size):
+        unique_name = uuid.uuid4()
+        block_count = math.ceil(total_size / block_size)
+        rich_console.print(':backhand_index_pointing_right: adding %s backing file (%s) of size %s:(%s×%s bytes)'
+            % (description, unique_name, total_size, block_count, block_size))
+        dd("if=/dev/zero", "of={}/{}".format(page_root, unique_name), "bs={}".format(block_size), "count={}".format(block_count))
+        loop_devname = losetup('-f', '--show', '{}/{}'.format(page_root, unique_name)).strip()
+        self.loop_devices.append(loop_devname)
+
+    def create_md_array(self, device_name, safe_zone_limit = ONE_GIBIBYTE-ONE_MEBIBYTE):
+        rich_console.print(':package: creating array ... ')
+        mdadm('--create', device_name, '--level=0', '--raid-devices={}'.format(len(self.loop_devices)), self.loop_devices)
+        sectors = safe_zone_limit / 512
+        mkfs('-t', 'f2fs', '-w', '512', device_name, sectors)
+
+    def create_safe_zone(self, device_name):
+        temporary_mount_point = '/tmp/{}'.format(uuid.uuid4())
+        mkdir(temporary_mount_point)
+        rich_console.print(':backhand_index_pointing_right: creating temporary mount point')
+        mount(device_name, temporary_mount_point)
+        rich_console.print(':backhand_index_pointing_right: checking free space')
+        stat = os.statvfs(temporary_mount_point)
+        free_space = (stat.f_bavail * stat.f_frsize)
+        if free_space < 800 * ONE_MEBIBYTE:
+            rich_console.print(':stop_sign: there is not enough free space in the safe-zone for any more content')
+        else:
+            rich_console.print(':backhand_index_pointing_right: downloading content ({})'.format(self.safe_zone_content_url))
+            curl('--output', '{}/content'.format(temporary_mount_point), self.safe_zone_content_url)
+            rich_console.print(':backhand_index_pointing_right: unpacking content ... ')
+            tar('-C', temporary_mount_point, '-x', '-f', '{}/content'.format(temporary_mount_point))
+            rm('{}/content'.format(temporary_mount_point))
+            rich_console.print(':backhand_index_pointing_right: finished')
+        rich_console.print(df('-h', temporary_mount_point))
+        umount(temporary_mount_point)
+        rmdir(temporary_mount_point)
+
+allocation_parser = argparse.ArgumentParser()
+allocation_parser.add_argument('-m', '--maximum', nargs='?', const=0, default=0, type=int,
+    help='''number of additional pages to allocate behind the safe zone, defaults to allocating as
+    many pages as would fit in available space.''')
+allocation_parser.add_argument('-s', '--pagesize', nargs='?', const=2147483648, default=2147483648, type=int,
+    help='size of each page to allocate, defaults to 2GiB.')
+allocation_parser.add_argument('-n', '--dry-run', action='store_true', default=False,
+    help='perform a trial run with no changes made')
+
+populate_header_parser = argparse.ArgumentParser()
+populate_header_parser.add_argument('-f', '--force', action='store_true', default=False,
+    help='force creation of new LUKS headers (content of existing PDZ will be inaccessible)')
+populate_header_parser.add_argument('--maximum-offset', nargs='?', const=DEFAULT_OFFSET_MAX_SECTORS, type=int,
+    help='maximum offset (in sectors) from the start of PDZ')
+
+class freedom_console(cmd2.Cmd):
+    intro = 'Welcome to freedom-console.  Type help or ? to list commands.\n'
+    prompt = '(main) '
+
+    def __init__(self):
+        super().__init__()
+        self.encrypted_device = encrypted_device()
+        self.raid_device = '/dev/md0'
+        self.username = 'freedom'
+        self.backing_page_root='/.space'
+        self.add_settable(cmd2.Settable('raid_device', str, 'Name of RAID device', onchange_cb = self._onchange))
+        self.add_settable(cmd2.Settable('username', str, 'Primary user of the PDZ', onchange_cb = self._onchange))
+        self.add_settable(cmd2.Settable('backing_page_root', str, 'Where to store the backing pages', onchange_cb = self._onchange))
+
+    def _onchange(self, param_name, old, new):
+        pass
+
+    @cmd2.with_argparser(allocation_parser)
+    def do_allocate(self, opts):
+        'Allocate space to the PDZ.  There will always be a safe-zone at the beginning of the device.'
+        if not os.path.isdir(self.backing_page_root):
+            os.mkdir(self.backing_page_root)
+        stat = os.statvfs(self.backing_page_root)
+        free_space = (stat.f_bavail * stat.f_frsize) - ONE_GIBIBYTE
+        bestfit_pages = math.floor(free_space / opts.pagesize)
+        pages_to_allocate = bestfit_pages if opts.maximum == 0 else opts.maximum
+        if free_space < 0 or pages_to_allocate < 1:
+            print('You do not have enough free space ...')
+            print('There are %s bytes left in the filesystem.' % (stat.f_bavail * stat.f_frsize))
+            print('But we need at least %s bytes for the safe-zone, and %s bytes for one page.' % (ONE_GIBIBYTE, opts.pagesize))
+            return
+        print('Freedom-Console will now create the following pages:')
+        print('> 1 page of %s bytes for the safe-zone' % (ONE_GIBIBYTE))
+        print('> %s pages of %s bytes for the plausibly-deniable zone' % (pages_to_allocate, opts.pagesize))
+        if (opts.dry_run == 0):
+            self.encrypted_device.attach_backing_file(self.backing_page_root, 'safe-zone', ONE_GIBIBYTE, 4096)
+            for n in range(pages_to_allocate):
+                self.encrypted_device.attach_backing_file(self.backing_page_root, 'pdzone({})'.format(n), opts.pagesize, 4096)
+            self.encrypted_device.create_md_array(self.raid_device)
+
+    def do_create_safe_zone(self, opts):
+        'Prepares the safe zone by populating it with innocuous content.'
+        self.encrypted_device.create_safe_zone(self.raid_device)
+
+    def do_populate_keys(self, opts):
+        'Populate the backing page area with random cryptographic keys'
+        keys_root = self.backing_page_root+'/.keys'
+        if not os.path.isdir(keys_root):
+            os.mkdir(keys_root)
+        rich_console.print(':backhand_index_pointing_right: creating random keys in {}'.format(keys_root))
+        for key in range(100):
+            dd('if=/dev/urandom', 'of={}/{:02d}'.format(keys_root, key), 'bs=512', 'count=16')
+        rich_console.print('[green]:heavy_check_mark:[/green] finished!')
+
+    @cmd2.with_argparser(populate_header_parser)
+    def do_populate_headers(self, opts):
+        'Populate the backing page area with random LUKS headers'
+        headers_root = self.backing_page_root+'/.headers'
+        if not os.path.isdir(headers_root):
+            os.mkdir(headers_root)
+        bag = list(range(0,100))
+        random.shuffle(bag)
+        rich_console.print(':backhand_index_pointing_right: creating random LUKS headers in {}'.format(headers_root))
+        header_number = 0
+        for key in bag:
+            randomized_key_offset = random.randint(0, 8192-512)
+            randomized_pdz_offset = random.randint(ONE_GIBIBYTE/512, (ONE_GIBIBYTE*2)/512)
+            rich_console.print(':locked_with_key: #{:02d} pointing {} sectors (base+{}) into device {}'.format(header_number, randomized_pdz_offset, randomized_pdz_offset - 2097152, self.raid_device))
+            rich_console.print('   locked with :key: #{:02d} with offset {}'.format(key, randomized_key_offset))
+            cryptsetup('luksFormat',
+                self.raid_device,
+                '--type', 'luks1',
+                '--batch-mode',
+                '--key-size', '512',
+                '--key-file', '{}/{:02d}'.format(self.backing_page_root+'/.keys', key),
+                '--keyfile-offset', randomized_key_offset,
+                '--header', '{}/{:02d}'.format(self.backing_page_root+'/.headers', header_number),
+                '--align-payload', randomized_pdz_offset)
+            header_number = header_number+1
+        rich_console.print('[green]:heavy_check_mark:[/green] finished!')
+
+    def do_enable(self, opts):
+        'Create a user account and prepare the PDZ for this user.'
+
+if __name__ == '__main__':
+    import sys
+    console = freedom_console()
+    sys.exit(console.cmdloop())
