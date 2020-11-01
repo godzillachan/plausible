@@ -82,6 +82,42 @@ header, and a payload-offset arrow pointing to the beginning of the PDZ>
 --------------> payload offset
 ```
 
+We employ obfuscation here by creating a number of LUKS headers, each with
+randomized *payload offset* into the PDZ in order to hide the true header.
+```
++------+ +------+ +------+ +------+ +------+
+| safe | | pdz1 | | pdz2 | | pdz3 | | pdz4 |
++------+ +------+ +------+ +------+ +------+
+            \___________    /
+                        \  |
++-------------------+   |  |
+| LUKS header #1    |--/   |
+|                   |      |
++-------------------+      |
++-------------------+      |
+| LUKS header #2    |------+
+|                   |
++-------------------+
+```
+
+In addition, we create a number of random binary cryptographic keys, and
+pick a random offset into each key to obtain 512-byte *key material*.
+
+A different key material is associated with each header, in order to increase
+the difficulty of brute-force attacks.
+```
++--------+ +--------+ +--------+ +--------+ +--------+
+| key #1 | | key #2 | | key #3 | | key #4 | | key #5 |
+|--------| |        | |        | |        | |        |
+|--------| |--------| |        | |--------| |        |
+|        | |--------| |        | |--------| |--------|
+|        | |        | |--------| |        | |--------|
++--------+ +--------+ +--------+ +--------+ +--------+
+```
+
+The combination of (*header*, *key*, and *key-offset)* is a tuple that is
+used to access the PDZ.
+
 ## FREEDOM-CONSOLE
 We ship a Python-based console to help create the environment described above.
 The console consists of the following major command groups:
@@ -191,8 +227,8 @@ required arguments:
   --offset OFFSET  offset into cryptographic key
 ```
 
-By *blessing* our PDZ, we are opening the *plausibly-deniable zone* with the tuple
-(header, key, key-offset) as well as creating a filesystem on it.  Since only
+By *blessing* the PDZ, you will open the *plausibly-deniable zone* with the tuple
+(header, key, key-offset) as well as create a filesystem on it.  Since only
 you know this tuple, it will be extremely difficult for an adversary to determine
 the correct tuple via brute-force attacks.
 
