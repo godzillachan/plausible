@@ -1,162 +1,579 @@
 #!/usr/bin/env python3
 import argparse
 import cmd2
+import glob
+import hashlib
 import math
-import os
+import mdstat
+import os, errno
 import random
 import rich.console
 import sh
+import sys
 import uuid
-from sh import rm, dd, df, losetup, mdadm, mkfs, mkdir, rmdir, mount, umount, curl, tar, cryptsetup
+from sh import cryptsetup, curl, dd, df, file, losetup, mdadm, mkdir, mkfs, modprobe, mount, rm, rmdir, tar, umount
+from shutil import which
 
+APP_NAME='freedom-console'
 ONE_GIBIBYTE=1073741824
 ONE_MEBIBYTE=1048576
 DEFAULT_OFFSET_MAX_SECTORS=(ONE_GIBIBYTE*2)/512
+RAID0_LAYOUT='/sys/module/raid0/parameters/default_layout'
+REQUIRED_TOOLS=['cryptsetup', 'mdadm', 'mkfs.f2fs']
+DEFAULT_KEY_COUNT=5
+DEFAULT_HEADER_COUNT=5
+DEFAULT_KEYFILE_SIZE=8192
+DEFAULT_KEY_SIZE=512
+DEFAULT_LUKS_SECTOR_SIZE=512
+DEFAULT_ROOT='/.space'
+DEFAULT_MD_NAME='freedom'
+DEFAULT_LUKS_DEVICE_NAME='freedom'
+DEFAULT_SAFEZONE_CONTENT_URL="https://cdn.kernel.org/pub/linux/kernel/v3.x/linux-3.19.8.tar.xz"
+
+HELP_TEXT_CREATE_MD_FIRST='You will need to decide how large you want the multiple-disk device to be. By default we will create as many data pages as will fit in the remaining free space of your machine. This is fine for running plausibly-deniable environment inside a virtual machine, but may not be appropriate otherwise.'
 
 rich_console = rich.console.Console()
 
-class encrypted_device:
-    def __init__(self):
-        super().__init__()
+def is_valid_uuid(candidate, version=4):
+    try:
+        id = uuid.UUID(candidate, version=version)
+    except ValueError:
+        return False
+    return str(id) == candidate
+
+
+
+class backing_pages:
+    def __init__(self, root = DEFAULT_ROOT):
+        self.root = root
+        self.keys_root = root+'/.k'
+        self.headers_root = root+'/.h'
+        self.active = False
+        self.pages = []
         self.loop_devices = []
-        self.safe_zone_content_url="https://cdn.kernel.org/pub/linux/kernel/v3.x/linux-3.19.8.tar.xz"
+        self.simulated_run = False
+        self.raid_device = None
+        self.update_backing_page_status()
+        self.luks_active = False
 
-    def attach_backing_file(self, page_root, description, total_size, block_size):
+    def update_backing_page_status(self, create_loop_devices = False, verbose = False):
+        self.pages = []
+        self.loop_devices = []
+        if verbose:
+            rich_console.print(':gear: checking loop device status in {}'.format(self.root))
+        if os.path.isdir(self.root):
+            for backing_file in os.listdir(self.root):
+                if is_valid_uuid(backing_file):
+                    full_path = self.root+'/'+backing_file
+                    self.pages.append(full_path)
+                    device = losetup('--associated', full_path, '-n', '-O', 'NAME')
+                    if not device and create_loop_devices:
+                        device = losetup('-f', '--show', '{}'.format(full_path))
+                    if device:
+                        status_symbol = '[green]:heavy_check_mark:[/green]'
+                        device_name = device.stdout.decode('utf-8').rstrip()
+                        backing_file_size = os.stat(full_path).st_size
+                        device_description = ' "{}" {} bytes'.format(device_name, backing_file_size)
+                        self.loop_devices.append(device_name)
+                    else:
+                        status_symbol = '[red]:heavy_multiplication_x:[/red]'
+                    if verbose: rich_console.print('{} {}{}'.format(status_symbol, backing_file, device_description if device else ''))
+        self.active = True if len(self.pages) == len(self.loop_devices) else False
+        if verbose and len(self.pages) == 0:
+            rich_console.print(':sweat: no backing pages has been created')
+        return self.active
+
+    def remove_pages(self):
+        def remove_backing_file(backing_file):
+            try:
+                os.remove(backing_file)
+            except OSError as e:
+                if e.errno != errno.NOENT:
+                    raise
+        if len(self.pages) == 0:
+            rich_console.print(':sweat: no backing pages seen so far, perhaps you need to \'pages list\' first.')
+            return False
+        self.deactivate()
+        for p in self.pages:
+            remove_backing_file(p)
+
+    def deactivate(self):
+        def remove_loopback_device(device):
+            try:
+                losetup('-d', device)
+            except sh.ErrorReturnCode as e:
+                print(e.stderr.decode('utf-8').strip())
+        self.loop_devices[:] = [device for device in self.loop_devices if remove_loopback_device(device)]
+
+    def set_root(self, root):
+        self.root = root
+        self.keys_root = root+'/.k'
+
+    def allocate_one_page(self, page_description, page_size = ONE_GIBIBYTE, block_size = 4096):
         unique_name = uuid.uuid4()
-        block_count = math.ceil(total_size / block_size)
-        rich_console.print(':backhand_index_pointing_right: adding %s backing file (%s) of size %s:(%s×%s bytes)'
-            % (description, unique_name, total_size, block_count, block_size))
-        dd("if=/dev/zero", "of={}/{}".format(page_root, unique_name), "bs={}".format(block_size), "count={}".format(block_count))
-        loop_devname = losetup('-f', '--show', '{}/{}'.format(page_root, unique_name)).strip()
-        self.loop_devices.append(loop_devname)
+        block_count = math.ceil(page_size / block_size)
+        rich_console.print(':gear: creating "{}" ({}:{}×{} bytes) for {}'.
+            format(unique_name, page_size, block_count, block_size, page_description))
+        if not self.simulated_run:
+            dd("if=/dev/zero", "of={}/{}".format(self.root, unique_name), "bs={}".format(block_size), "count={}".format(block_count))
+        return unique_name
 
-    def create_md_array(self, device_name, safe_zone_limit = ONE_GIBIBYTE-ONE_MEBIBYTE):
-        rich_console.print(':package: creating array ... ')
-        mdadm('--create', device_name, '--level=0', '--raid-devices={}'.format(len(self.loop_devices)), self.loop_devices)
-        sectors = safe_zone_limit / 512
-        mkfs('-t', 'f2fs', '-w', '512', device_name, sectors)
+    def allocate_pages(self, data_page_size = ONE_GIBIBYTE, limit = 0, simulated_run = False):
+        self.simulated_run = simulated_run
+        if not os.path.isdir(self.root):
+            os.mkdir(self.root)
+        stat = os.statvfs(self.root)
+        free_space = (stat.f_bavail * stat.f_frsize)
+        maximum_data_pages = math.floor(free_space / data_page_size)
+        data_pages_to_allocate = maximum_data_pages if limit == 0 else limit
+        free_space = free_space - (data_page_size * data_pages_to_allocate)
+        if free_space < 0 or maximum_data_pages < 1:
+            at_least_this_many = 1 if limit == 0 else data_pages_to_allocate
+            rich_console.print(':sweat: you do not have enough free space.')
+            rich_console.print('> {} bytes available in the filesystem, but we need'.format(free_space))
+            rich_console.print('  {}×{} bytes (data pages) -> {}'.format(data_page_size, at_least_this_many, free_space))
+            return
+        for p_no in range(data_pages_to_allocate):
+            self.allocate_one_page('page #{}'.format(p_no), data_page_size)
+        self.update_backing_page_status(create_loop_devices = True)
 
-    def create_safe_zone(self, device_name):
+    def start_raid_device(self, device_name = DEFAULT_MD_NAME):
+        # sanity check: do not proceed unless we have some backing pages
+        if len(self.pages) == 0:
+            rich_console.print(':sweat: you need to create backing pages first')
+            return
+        self.update_raid_device_status()
+        if self.raid_device is not None:
+            rich_console.print(':computer_disk: {} is already active'.format(self.raid_device))
+            return
+        # if someone is trying to start raid without backing pages already active, try to start the
+        # backing pages for them ...
+        if not self.active:
+            self.update_backing_page_status(create_loop_devices = True, verbose = True)
+        if os.path.isdir('/dev/md/'+device_name):
+            rich_console.print(':sweat: device \'{}\' is already present, please use another name'.format(device_name))
+            rich_console.print('> md start --device [italic]name[/italic]')
+            rich_console.print('* specify the [italic]name[/italic] without the leading "/dev"')
+            rich_console.print('* you may use "!cat /proc/mdstat" to see currently active multiple-disk devices')
+        # "starting" raid means to assemble it from backing files if they already have the metadata,
+        # or create new array if no metadata is present.
+        magic = file('-b', self.pages[0]).strip()
+        if magic == 'data':
+            mdadm('--create', device_name, '--level=0', '--raid-devices={}'.format(len(self.loop_devices)), self.loop_devices)
+        else:
+            mdadm('--assemble', device_name, self.loop_devices)
+        self.update_raid_device_status(verbose = True)
+
+    def stop_raid_device(self):
+        self.update_raid_device_status()
+        if self.raid_device is not None:
+            mdadm('--stop', self.raid_device)
+
+    def update_raid_device_status(self, verbose = False):
+        # sanity check: do not proceed unless we have some backing pages
+        if len(self.pages) == 0:
+            rich_console.print(':sweat: backing page directory \'{}\' appears to be empty'.format(self.root))
+            return
+        self.raid_device = None
+        self.update_backing_page_status()
+        for device in os.listdir('/sys/block'):
+            if os.path.isdir('/sys/block/{}/md'.format(device)):
+                matched = 0
+                for slave in os.listdir('/sys/block/{}/slaves'.format(device)):
+                    backing_file_info = '/sys/block/{}/slaves/{}/loop/backing_file'.format(device, slave)
+                    if os.path.isfile(backing_file_info):
+                        with open(backing_file_info) as f:
+                            backing_file = f.read().strip()
+                            if backing_file in self.pages:
+                                matched = matched + 1
+                if matched == len(self.pages):
+                    self.raid_device = device
+                    if verbose:
+                        rich_console.print(':computer_disk: {} is our multiple-disk device'.format(self.raid_device))
+        if self.raid_device is None and verbose:
+            rich_console.print(':sweat: multiple-disk device is inactive')
+
+    def populate_safezone(self):
+        # sanity check: do not proceed unless we have some backing pages
+        if len(self.pages) == 0:
+            rich_console.print(':sweat: you need to create backing pages first')
+            return
+        # if someone is trying to start raid without backing pages already active, try to start the
+        # backing pages for them ...
+        if not self.active:
+            self.update_backing_page_status(create_loop_devices = True, verbose = True)
+        self.update_raid_device_status()
+        if self.raid_device is None:
+            self.start_raid_device()
+        if self.raid_device is None:
+            rich_console.print(':sweat: we seem to be having trouble starting multiple-disk device')
+            return
+        self.update_raid_device_status()
+        os_device_name = '/dev/'+self.raid_device
+        safezone_total_sectors = ONE_GIBIBYTE-ONE_MEBIBYTE
+        rich_console.print(':gear: creating filesystem on {}'.format(os_device_name))
+        mkfs('-t', 'f2fs', '-f', '-w', '512', os_device_name, safezone_total_sectors)
         temporary_mount_point = '/tmp/{}'.format(uuid.uuid4())
         mkdir(temporary_mount_point)
-        rich_console.print(':backhand_index_pointing_right: creating temporary mount point')
-        mount(device_name, temporary_mount_point)
-        rich_console.print(':backhand_index_pointing_right: checking free space')
+        rich_console.print(':gear: safe-zone is mounted on {}'.format(temporary_mount_point))
+        mount(os_device_name, temporary_mount_point)
         stat = os.statvfs(temporary_mount_point)
         free_space = (stat.f_bavail * stat.f_frsize)
         if free_space < 800 * ONE_MEBIBYTE:
             rich_console.print(':stop_sign: there is not enough free space in the safe-zone for any more content')
         else:
-            rich_console.print(':backhand_index_pointing_right: downloading content ({})'.format(self.safe_zone_content_url))
-            curl('--output', '{}/content'.format(temporary_mount_point), self.safe_zone_content_url)
-            rich_console.print(':backhand_index_pointing_right: unpacking content ... ')
+            rich_console.print(':gear: downloading content ({})'.format(DEFAULT_SAFEZONE_CONTENT_URL))
+            curl('--output', '{}/content'.format(temporary_mount_point), DEFAULT_SAFEZONE_CONTENT_URL)
+            rich_console.print(':gear: unpacking content ... ')
             tar('-C', temporary_mount_point, '-x', '-f', '{}/content'.format(temporary_mount_point))
             rm('{}/content'.format(temporary_mount_point))
-            rich_console.print(':backhand_index_pointing_right: finished')
-        rich_console.print(df('-h', temporary_mount_point))
+        rich_console.print(df('-h', temporary_mount_point).strip())
         umount(temporary_mount_point)
         rmdir(temporary_mount_point)
 
-allocation_parser = argparse.ArgumentParser()
-allocation_parser.add_argument('-m', '--maximum', nargs='?', const=0, default=0, type=int,
-    help='''number of additional pages to allocate behind the safe zone, defaults to allocating as
-    many pages as would fit in available space.''')
-allocation_parser.add_argument('-s', '--pagesize', nargs='?', const=2147483648, default=2147483648, type=int,
-    help='size of each page to allocate, defaults to 2GiB.')
-allocation_parser.add_argument('-n', '--dry-run', action='store_true', default=False,
-    help='perform a trial run with no changes made')
+    def list_cryptographic_keys(self):
+        block_hasher = hashlib.md5()
+        if os.path.isdir(self.keys_root):
+            for name in os.listdir(self.keys_root):
+                with open(self.keys_root+'/'+name, 'rb') as key:
+                    buffer = key.read()
+                    block_hasher.update(buffer)
+                    print('{} md5={}'.format(name, block_hasher.hexdigest()))
 
-populate_header_parser = argparse.ArgumentParser()
-populate_header_parser.add_argument('-f', '--force', action='store_true', default=False,
-    help='force creation of new LUKS headers (content of existing PDZ will be inaccessible)')
-populate_header_parser.add_argument('--maximum-offset', nargs='?', const=DEFAULT_OFFSET_MAX_SECTORS, type=int,
-    help='maximum offset (in sectors) from the start of PDZ')
+    def create_cryptographic_keys(self, count = DEFAULT_KEY_COUNT):
+        if not os.path.isdir(self.keys_root):
+            os.mkdir(self.keys_root)
+        keys_count = len([name for name in os.listdir(self.keys_root) if os.path.isfile(os.path.join(self.keys_root, name))])
+        rich_console.print(':gear: creating {} random cryptographic keys in {}'.format(count, self.keys_root))
+        keyblock_count = math.ceil(DEFAULT_KEYFILE_SIZE / DEFAULT_KEY_SIZE)
+        for k in range(count):
+            unique_keyfile_name = uuid.uuid4()
+            dd('if=/dev/urandom', 'of={}/{}'.format(self.keys_root, unique_keyfile_name), 'bs={}'.format(DEFAULT_KEY_SIZE), 'count={}'.format(keyblock_count))
+        rich_console.print('[green]:heavy_check_mark:[/green] finished')
 
-class freedom_console(cmd2.Cmd):
-    intro = 'Welcome to freedom-console.  Type help or ? to list commands.\n'
-    prompt = '(main) '
-
-    def __init__(self):
-        super().__init__()
-        self.encrypted_device = encrypted_device()
-        self.raid_device = '/dev/md0'
-        self.username = 'freedom'
-        self.backing_page_root='/.space'
-        self.add_settable(cmd2.Settable('raid_device', str, 'Name of RAID device', onchange_cb = self._onchange))
-        self.add_settable(cmd2.Settable('username', str, 'Primary user of the PDZ', onchange_cb = self._onchange))
-        self.add_settable(cmd2.Settable('backing_page_root', str, 'Where to store the backing pages', onchange_cb = self._onchange))
-
-    def _onchange(self, param_name, old, new):
-        pass
-
-    @cmd2.with_argparser(allocation_parser)
-    def do_allocate(self, opts):
-        'Allocate space to the PDZ.  There will always be a safe-zone at the beginning of the device.'
-        if not os.path.isdir(self.backing_page_root):
-            os.mkdir(self.backing_page_root)
-        stat = os.statvfs(self.backing_page_root)
-        free_space = (stat.f_bavail * stat.f_frsize) - ONE_GIBIBYTE
-        bestfit_pages = math.floor(free_space / opts.pagesize)
-        pages_to_allocate = bestfit_pages if opts.maximum == 0 else opts.maximum
-        if free_space < 0 or pages_to_allocate < 1:
-            print('You do not have enough free space ...')
-            print('There are %s bytes left in the filesystem.' % (stat.f_bavail * stat.f_frsize))
-            print('But we need at least %s bytes for the safe-zone, and %s bytes for one page.' % (ONE_GIBIBYTE, opts.pagesize))
+    def remove_cryptographic_keys(self, force = False):
+        if not force:
+            rich_console.print(':sweat: please use "--affirmative" to prevent accidental removal of cryptographic keys')
             return
-        print('Freedom-Console will now create the following pages:')
-        print('> 1 page of %s bytes for the safe-zone' % (ONE_GIBIBYTE))
-        print('> %s pages of %s bytes for the plausibly-deniable zone' % (pages_to_allocate, opts.pagesize))
-        if (opts.dry_run == 0):
-            self.encrypted_device.attach_backing_file(self.backing_page_root, 'safe-zone', ONE_GIBIBYTE, 4096)
-            for n in range(pages_to_allocate):
-                self.encrypted_device.attach_backing_file(self.backing_page_root, 'pdzone({})'.format(n), opts.pagesize, 4096)
-            self.encrypted_device.create_md_array(self.raid_device)
+        keys = glob.glob(self.keys_root+'/*')
+        for k in keys:
+            try:
+                os.unlink(k)
+            except OSError as e:
+                print('error removing key file {}:{}'.format(k, e.strerror))
 
-    def do_create_safe_zone(self, opts):
-        'Prepares the safe zone by populating it with innocuous content.'
-        self.encrypted_device.create_safe_zone(self.raid_device)
+    def list_luks_headers(self):
+        if os.path.isdir(self.headers_root):
+            for name in os.listdir(self.headers_root):
+                    print('{}'.format(name))
 
-    def do_populate_keys(self, opts):
-        'Populate the backing page area with random cryptographic keys'
-        keys_root = self.backing_page_root+'/.keys'
-        if not os.path.isdir(keys_root):
-            os.mkdir(keys_root)
-        rich_console.print(':backhand_index_pointing_right: creating random keys in {}'.format(keys_root))
-        for key in range(100):
-            dd('if=/dev/urandom', 'of={}/{:02d}'.format(keys_root, key), 'bs=512', 'count=16')
-        rich_console.print('[green]:heavy_check_mark:[/green] finished!')
-
-    @cmd2.with_argparser(populate_header_parser)
-    def do_populate_headers(self, opts):
-        'Populate the backing page area with random LUKS headers'
-        headers_root = self.backing_page_root+'/.headers'
-        if not os.path.isdir(headers_root):
-            os.mkdir(headers_root)
-        bag = list(range(0,100))
-        random.shuffle(bag)
-        rich_console.print(':backhand_index_pointing_right: creating random LUKS headers in {}'.format(headers_root))
-        header_number = 0
-        for key in bag:
-            randomized_key_offset = random.randint(0, 8192-512)
-            randomized_pdz_offset = random.randint(ONE_GIBIBYTE/512, (ONE_GIBIBYTE*2)/512)
-            rich_console.print(':locked_with_key: #{:02d} pointing {} sectors (base+{}) into device {}'.format(header_number, randomized_pdz_offset, randomized_pdz_offset - 2097152, self.raid_device))
-            rich_console.print('   locked with :key: #{:02d} with offset {}'.format(key, randomized_key_offset))
+    def create_luks_headers(self, count = DEFAULT_HEADER_COUNT):
+        self.update_raid_device_status()
+        if self.raid_device is None:
+            rich_console.print(':gear: auto-starting multiple-disk device ...')
+            self.start_raid_device()
+        if self.raid_device is None:
+            rich_console.print(':sweat: it looks like you have not created any multiple-disk device')
+            rich_console.print(HELP_TEXT_CREATE_MD_FIRST)
+            return
+        if not os.path.isdir(self.headers_root):
+            os.mkdir(self.headers_root)
+        rich_console.print(':gear: creating {} LUKS headers in {}'.format(count, self.headers_root))
+        self.create_cryptographic_keys(count = count)
+        keys_bag = os.listdir(self.keys_root)
+        random.shuffle(keys_bag)
+        for keyfile in keys_bag:
+            unique_name = uuid.uuid4()
+            keyfile_offset = random.randint(0, DEFAULT_KEYFILE_SIZE - DEFAULT_KEY_SIZE)
+            pdzone_offset = random.randint(ONE_GIBIBYTE/DEFAULT_LUKS_SECTOR_SIZE, (ONE_GIBIBYTE+ONE_MEBIBYTE)/DEFAULT_LUKS_SECTOR_SIZE)
+            base = math.ceil(ONE_GIBIBYTE/DEFAULT_LUKS_SECTOR_SIZE)
+            rich_console.print(':locked_with_key: \'{}\' zone-offset: (base+{}) using :key: \'{}\' key-offset: {}'.
+                format(unique_name, pdzone_offset-base, keyfile, keyfile_offset))
             cryptsetup('luksFormat',
-                self.raid_device,
+                '/dev/{}'.format(self.raid_device),
                 '--type', 'luks1',
                 '--batch-mode',
                 '--key-size', '512',
-                '--key-file', '{}/{:02d}'.format(self.backing_page_root+'/.keys', key),
-                '--keyfile-offset', randomized_key_offset,
-                '--header', '{}/{:02d}'.format(self.backing_page_root+'/.headers', header_number),
-                '--align-payload', randomized_pdz_offset)
-            header_number = header_number+1
-        rich_console.print('[green]:heavy_check_mark:[/green] finished!')
+                '--key-file', '{}/{}'.format(self.keys_root, keyfile),
+                '--keyfile-offset', keyfile_offset,
+                '--header', '{}/{}'.format(self.headers_root, unique_name),
+                '--align-payload', pdzone_offset)
+        rich_console.print('[green]:heavy_check_mark:[/green] finished')
 
-    def do_enable(self, opts):
-        'Create a user account and prepare the PDZ for this user.'
+    def remove_luks_headers(self, force = False):
+        if not force:
+            rich_console.print(':sweat: please use "--affirmative" to prevent accidental removal of LUKS headers')
+            return
+        headers = glob.glob(self.headers_root+'/*')
+        for h in headers:
+            try:
+                os.unlink(h)
+            except OSError as e:
+                print('error removing header {}:{}'.format(h, e.strerror))
+
+    def start_luks_device(self, header = None, keyfile = None, keyfile_offset = None, bless = False):
+        self.update_raid_device_status()
+        if self.raid_device is None:
+            rich_console.print(':gear: auto-starting multiple-disk device ...')
+            self.start_raid_device()
+        if self.raid_device is None:
+            rich_console.print(':sweat: it looks like you have not created any multiple-disk device')
+            rich_console.print(HELP_TEXT_CREATE_MD_FIRST)
+            return
+
+        if not os.path.isfile(self.keys_root+'/'+keyfile):
+            rich_console.print(':stop_sign: key \'{}\' does not exist'.format(keyfile))
+            return
+        if not os.path.isfile(self.headers_root+'/'+header):
+            rich_console.print(':stop_sign: header \'{}\' does not exist'.format(header))
+            return
+
+        if not self.luks_active:
+            rich_console.print(':gear: opening LUKS device /dev/mapper/{}'.format(DEFAULT_LUKS_DEVICE_NAME))
+            try:
+                cryptsetup('luksOpen',
+                    '/dev/{}'.format(self.raid_device),
+                    '{}'.format(DEFAULT_LUKS_DEVICE_NAME),
+                    '--key-size', '512',
+                    '--key-file', '{}/{}'.format(self.keys_root, keyfile),
+                    '--keyfile-offset', keyfile_offset,
+                    '--header', '{}/{}'.format(self.headers_root, header))
+                self.luks_active = True
+            except sh.ErrorReturnCode as e:
+                print(e.stderr.decode('utf-8').strip())
+
+        if bless:
+            rich_console.print(':gear: creating filesystem on /dev/mapper/{}'.format(DEFAULT_LUKS_DEVICE_NAME))
+            mkfs('-t', 'ext4', '/dev/mapper/{}'.format(DEFAULT_LUKS_DEVICE_NAME))
+
+    def stop_luks_device(self):
+        if not self.luks_active:
+            return
+        try:
+            cryptsetup('luksClose', '/dev/mapper/{}'.format(DEFAULT_LUKS_DEVICE_NAME))
+            self.luks_active = False
+        except sh.ErrorReturnCode as e:
+            print(e.stderr.decode('utf-8').strip())
+
+
+
+class freedom_console(cmd2.Cmd):
+    intro = 'Welcome to {}.  Type help or ? to list commands.'.format(APP_NAME)
+    prompt = '> '
+
+    def __init__(self):
+        super().__init__()
+        self.hidden_commands.append('alias')
+        self.hidden_commands.append('edit')
+        self.hidden_commands.append('history')
+        self.hidden_commands.append('macro')
+        self.hidden_commands.append('py')
+        self.hidden_commands.append('run_pyscript')
+        self.hidden_commands.append('run_script')
+        self.hidden_commands.append('shell')
+        self.hidden_commands.append('shortcuts')
+        self.remove_settable('allow_style')
+        self.remove_settable('always_show_hint')
+        self.remove_settable('debug')
+        self.remove_settable('echo')
+        self.remove_settable('editor')
+        self.remove_settable('feedback_to_output')
+        self.remove_settable('max_completion_items')
+        self.remove_settable('quiet')
+        self.remove_settable('timing')
+        self.backing_pages = backing_pages()
+
+    def on_parameter_change(self, param, old, value):
+        if param == 'root':
+            self.backing_pages.set_root(value)
+
+    def pages_create(self, opts):
+        print('creating pages in {}'.format(opts.root))
+        self.backing_pages.set_root(opts.root)
+        self.backing_pages.allocate_pages(simulated_run = opts.simulated,
+            data_page_size = opts.data_pagesize,
+            limit = opts.maximum)
+
+    def pages_remove(self, opts):
+        if opts.affirmative:
+            self.backing_pages.remove_pages()
+        else:
+            rich_console.print(':skull: WARNING: this action is irreversible, add --affirmative to the remove subcommand to confirm')
+            rich_console.print('   that you really want to remove the backing pages and try again.')
+
+    def pages_list(self, opts):
+        self.backing_pages.set_root(opts.root)
+        self.backing_pages.update_backing_page_status(create_loop_devices = False, verbose = True)
+
+    def pages_activate(self, opts):
+        self.backing_pages.update_backing_page_status(create_loop_devices = True, verbose = True)
+
+    def pages_deactivate(self, opts):
+        self.backing_pages.deactivate()
+
+    pages_parser = argparse.ArgumentParser()
+    pages_subparsers = pages_parser.add_subparsers(title='Subcommands')
+    pages_create_parser = pages_subparsers.add_parser('create',
+            help='Allocate space to the Plausibly-Deniable Environment (PDE) by allocate backing pages. The PDE consists of safe-zone at the beginning of the device, followed by the Plausibly-Deniable Zone (PDZ) behind it at some random offset.')
+    pages_create_parser.add_argument('-m', '--maximum',
+            help='number of data pages to allocate, default is to allocate as many pages as would fit in available space',
+            nargs='?', type=int, const=0, default=0)
+    pages_create_parser.add_argument('-d', '--data_pagesize',
+            help='size of each page to allocate, defaults to 1GiB.',
+            nargs='?', type=int, const=ONE_GIBIBYTE, default=ONE_GIBIBYTE)
+    pages_create_parser.add_argument('-n', '--simulated',
+            help='perform a trial run with no changes made',
+            action='store_true', default=False)
+    pages_create_parser.add_argument('--root',
+            help='root directory of the backing pages',
+            type=str, default=DEFAULT_ROOT)
+    pages_create_parser.set_defaults(target=pages_create)
+    pages_remove_parser = pages_subparsers.add_parser('remove', help='Remove backing pages')
+    pages_remove_parser.add_argument('--affirmative', help='Really remove the backing pages, plausibly-deniable environment will be lost', action='store_true')
+    pages_remove_parser.set_defaults(target=pages_remove)
+    pages_list_parser = pages_subparsers.add_parser('list', help='Display information about the backing pages')
+    pages_list_parser.add_argument('--root',
+            help='root directory of the backing pages',
+            type=str, default=DEFAULT_ROOT)
+    pages_list_parser.set_defaults(target=pages_list)
+    pages_activate_parser = pages_subparsers.add_parser('activate', help='Activate backing pages')
+    pages_activate_parser.set_defaults(target=pages_activate)
+    pages_deactivate_parser = pages_subparsers.add_parser('deactivate', help='Deactivate backing pages')
+    pages_deactivate_parser.set_defaults(target=pages_deactivate)
+    @cmd2.with_argparser(pages_parser)
+    def do_pages(self, opts):
+        '''Operate on backing pages which are the fundamental building blocks for the plausibly-deniable environment.'''
+        target = getattr(opts, 'target', None)
+        if target is not None:
+            target(self, opts)
+        else:
+            self.do_help('pages')
+
+    def md_start(self, opts):
+        self.backing_pages.start_raid_device(opts.device)
+
+    def md_stop(self, opts):
+        self.backing_pages.stop_raid_device()
+
+    def md_status(self, opts):
+        self.backing_pages.update_raid_device_status(verbose = True)
+
+    def md_populate_safezone(self, opts):
+        self.backing_pages.populate_safezone()
+
+    md_parser = argparse.ArgumentParser()
+    md_subparsers = md_parser.add_subparsers(title='Subcommands')
+    md_start_parser = md_subparsers.add_parser('start', help='start multiple-disk device')
+    md_start_parser.add_argument('--device', help='name of multiple-disk device',
+        type=str, default=DEFAULT_MD_NAME)
+    md_start_parser.set_defaults(target=md_start)
+    md_stop_parser = md_subparsers.add_parser('stop', help='stop multiple-disk device')
+    md_stop_parser.set_defaults(target=md_stop)
+    md_status_parser = md_subparsers.add_parser('status', help='status of the multiple-disk device')
+    md_status_parser.set_defaults(target=md_status)
+    md_populate_safezone_parser = md_subparsers.add_parser('populate-safezone', help='populate multiple-disk device with innocuous content')
+    md_populate_safezone_parser.set_defaults(target=md_populate_safezone)
+    @cmd2.with_argparser(md_parser)
+    def do_md(self, opts):
+        'Operate on multiple-disk device that holds the plausibly-deniable environment.'
+        target = getattr(opts, 'target', None)
+        if target is not None:
+            target(self, opts)
+        else:
+            self.do_help('md')
+
+    def keys_list(self, opts):
+        self.backing_pages.list_cryptographic_keys()
+
+    def keys_create(self, opts):
+        self.backing_pages.create_cryptographic_keys(count = opts.count)
+
+    def keys_remove(self, opts):
+        self.backing_pages.remove_cryptographic_keys(force = opts.affirmative)
+
+    keys_parser = argparse.ArgumentParser()
+    keys_subparsers = keys_parser.add_subparsers(title='Keys Subcommands')
+    keys_create_parser = keys_subparsers.add_parser('create', help='create random cryptographic keys')
+    keys_create_parser.add_argument('--count', help='number of keys to create (default = {})'.format(DEFAULT_KEY_COUNT),
+            nargs='?', type=int, const=DEFAULT_KEY_COUNT, default=DEFAULT_KEY_COUNT)
+    keys_create_parser.set_defaults(target=keys_create)
+    keys_remove_parser = keys_subparsers.add_parser('remove', help='remove cryptographic keys')
+    keys_remove_parser.add_argument('--affirmative', help='confirm removal of keys',
+            action='store_true', default=False)
+    keys_remove_parser.set_defaults(target=keys_remove)
+    keys_list_parser = keys_subparsers.add_parser('list', help='list cryptographic keys')
+    keys_list_parser.set_defaults(target=keys_list)
+    @cmd2.with_argparser(keys_parser)
+    def do_keys(self, opts):
+        'Operate on cryptographic keys that are used to lock and unlock content of the plausibly-deniable environment.'
+        target = getattr(opts, 'target', None)
+        if target is not None:
+            target(self, opts)
+        else:
+            self.do_help('keys')
+
+    def headers_list(self, opts):
+        self.backing_pages.list_luks_headers()
+
+    def headers_create(self, opts):
+        self.backing_pages.create_luks_headers(count = opts.count)
+
+    def headers_remove(self, opts):
+        self.backing_pages.remove_luks_headers(force = opts.affirmative)
+
+    headers_parser = argparse.ArgumentParser()
+    headers_subparsers = headers_parser.add_subparsers(title='LUKS Header Subcommands')
+    headers_create_parser = headers_subparsers.add_parser('create', help='create random headers')
+    headers_create_parser.add_argument('--count', help='number of headers to create (default = {})'.format(DEFAULT_HEADER_COUNT),
+            nargs='?', type=int, const=DEFAULT_HEADER_COUNT, default=DEFAULT_HEADER_COUNT)
+    headers_create_parser.set_defaults(target=headers_create)
+    headers_remove_parser = headers_subparsers.add_parser('remove', help='remove headers')
+    headers_remove_parser.add_argument('--affirmative', help='confirm removal of headers',
+            action='store_true', default=False)
+    headers_remove_parser.set_defaults(target=headers_remove)
+    headers_list_parser = headers_subparsers.add_parser('list', help='list headers and associated information')
+    headers_list_parser.set_defaults(target=headers_list)
+    @cmd2.with_argparser(headers_parser)
+    def do_headers(self, opts):
+        'Operate on LUKS headers that are used to access the plausibly-deniable content.'
+        target = getattr(opts, 'target', None)
+        if target is not None:
+            target(self, opts)
+        else:
+            self.do_help('headers')
+
+    def pde_start(self, opts):
+        self.backing_pages.start_luks_device(header = opts.header, keyfile = opts.key, keyfile_offset = opts.offset, bless = opts.bless)
+
+    def pde_stop(self, opts):
+        self.backing_pages.stop_luks_device()
+
+    pde_parser = argparse.ArgumentParser()
+    pde_subparsers = pde_parser.add_subparsers(title='Subcommands')
+    pde_start_parser = pde_subparsers.add_parser('start', help='start plausibly-deniable environment')
+    pde_start_parser.add_argument('--bless', help='create a fresh filesystem on the plausibly-deniable environment', action='store_true')
+    pde_start_parser_required = pde_start_parser.add_argument_group('required arguments')
+    pde_start_parser_required.add_argument('--header', help='header uuid', type=str, required=True)
+    pde_start_parser_required.add_argument('--key', help='key uuid', type=str, required=True)
+    pde_start_parser_required.add_argument('--offset', help='offset into cryptographic key', type=int, required=True)
+    pde_start_parser.set_defaults(target=pde_start)
+    pde_stop_parser = pde_subparsers.add_parser('stop', help='stop plausibly-deniable environment')
+    pde_stop_parser.set_defaults(target=pde_stop)
+    @cmd2.with_argparser(pde_parser)
+    def do_pde(self, opts):
+        'Operate on the plausibly-deniable environment.'
+        target = getattr(opts, 'target', None)
+        if target is not None:
+            target(self, opts)
+        else:
+            self.do_help('pde')
+
+    def do_status(self, opts):
+        'Show status of the plausibly-deniable environment'
+        rich_console.print(':memo: backing pages are {}'.format('active' if self.backing_pages.active else 'inactive'))
+        rich_console.print(':package: md device is {}'.format('active' if self.backing_pages.raid_device is not None else 'inactive'))
+#       rich_console.print(':{}: LUKS is {}'.format('locked_with_key' if self.luks_active else 'unlocked', 'active' if self.luks_active else 'inactive'))
 
 if __name__ == '__main__':
-    import sys
     console = freedom_console()
     sys.exit(console.cmdloop())
