@@ -27,46 +27,173 @@ to reveal the passphrase when demanded.*
 Additionally, special care must be given if your outer shell is a virtual
 machine.  See the [special notes](#special-notes) for more details.
 
-**PLAUSIBLY-DENIABLE INTERIOR**: we are going to set up a *plausibly-deniable
-interior* environment sitting on top of your FDE outer shell. This provides
-the true layer of encryption and obfuscation and increases the difficulty for
-an adversary to locate and piece together this environment.
+**PLAUSIBLY-DENIABLE ENVIRONMENT**: we are going to set up a *plausibly-deniable
+environment* sitting on top of your FDE outer shell. This provides the true
+layer of encryption and obfuscation and increases the difficulty for an adversary
+to locate and piece together this environment.
 
-This interior is assembled from sensitive data hosted off-site, and
-from *physical volumes* (PV) stored on the *outer shell*'s local filesystem.
+This environment is assembled from sensitive data hosted off-site, and
+from *backing pages* stored on the *outer shell*'s local filesystem.
 
 ## IMPLEMENTATION
-The PDI consists of physical volumes on the local filesystem of the *outer
-shell*.  These physical volumes are assembled to form a single *logical volume*
-(LV) on demand.
+The PDE consists of a series of *backing pages* on the local filesystem of the *outer
+shell*.  These *backing pages* are assembled to form a single *multiple-device* (md) on
+demand.
 
-<diagram showing five chunks of data represented as squares, denote
-one chunk as special via dotted outline>
+```
+<diagram showing backing pages represented as squares, denote
+one backing page as special via dotted outline>
++------+ +------+ +------+ +------+ +------+
+| safe | |      | |      | |      | |      |
++------+ +------+ +------+ +------+ +------+
+```
 
-We denote one physical volume as *safe-zone*.  This volume must be large enough
+We denote one backing page as *safe-zone*.  This *safe-zone* must be large enough
 to hold an actual filesystem with innocuous content, e.g., a fully unpacked Linux
-filesystem for an embedded platform such as a Raspberry Pi.
-
-These PV's are assembled to form a logical volume as soon as *loopback devices*
-are created.  Furthermore, because we put safe-zone content on the LV, we can 
-show this safe-zone in good faith when demanded.
+kernel source tree for an embedded platform such as a Raspberry Pi.  Because we put
+*safe-zone* content at the beginning of the device, we can show this safe-zone in
+good faith when demanded.
 
 **NOTE**: any write operation you make to the safe-zone risks corrupting the true
-content of your PDI depending on the choice of filesystem you use.  For a higher
+content of your PDE depending on the choice of filesystem you use.  For a higher
 level of predictability, a log-structured filesystem such as F2FS could be used to
-store the safe-zone content. 
+store the safe-zone content.
 
-Once the PDI LV is created, we will have a plausible-deniability zone (PDZ) behind
-the safe-zone to store our true hidden content.
+The true plausibly-deniable zone (PDZ) exists behind the safe-zone to store our
+true hidden content.
 
-<diagram showing the assembled logical volume consisting of the safe-zone content
-and blank area behind it>
+```
+<diagram showing backing pages with safe-zone content and pdz pages behind it>
++------+ +------+ +------+ +------+ +------+
+| safe | | pdz1 | | pdz2 | | pdz3 | | pdz4 |
++------+ +------+ +------+ +------+ +------+
+```
 
 The PDZ is implemented via LUKS (Linux Unified Key Setup) cryptographic system
 where we detach the *LUKS header*, and employ *payload offset* so that we can
 reach into the PDZ when we wish to access the content.
 
+```
 <diagram showing the above assembly diagram, with additional block depicting LUKS
 header, and a payload-offset arrow pointing to the beginning of the PDZ>
++------+ +------+ +------+ +------+ +------+
+| safe | | pdz1 | | pdz2 | | pdz3 | | pdz4 |
++------+ +------+ +------+ +------+ +------+
+--------------> payload offset
+```
+
+## FREEDOM-CONSOLE
+We ship a Python-based console to help create the environment described above.
+The console consists of the following major command groups:
+* pages
+* md
+* keys
+* headers
+* pde
+
+The **pages** command is used to create backing pages on your outer-shell.  By default
+we create as many pages as will fit in the remaining space of your outer-shell.
+However you can use parameters to the *pages* command to tune this behavior.
+
+```
+> pages create -h
+usage: pages create [-h] [-m [MAXIMUM]] [-d [DATA_PAGESIZE]] [-n] [--root ROOT]
+
+optional arguments:
+  -h, --help            show this help message and exit
+  -m [MAXIMUM], --maximum [MAXIMUM]
+                        number of data pages to allocate, default is to allocate as many pages as would fit in available space
+  -d [DATA_PAGESIZE], --data_pagesize [DATA_PAGESIZE]
+                        size of each page to allocate, defaults to 1GiB.
+  -n, --simulated       perform a trial run with no changes made
+  --root ROOT           root directory of the backing pages
+```
+
+Once you have created the *backing pages*, you can assemble them into a
+*multiple-device* (md) to be used by LUKS layer.  The **md** command is used
+to manage it.
+```
+> md -h
+usage: md [-h] {start,stop,status,populate-safezone} ...
+
+Operate on multiple-disk device that holds the plausibly-deniable environment.
+
+optional arguments:
+  -h, --help            show this help message and exit
+
+Subcommands:
+  {start,stop,status,populate-safezone}
+    start               start multiple-disk device
+    stop                stop multiple-disk device
+    status              status of the multiple-disk device
+    populate-safezone   populate multiple-disk device with innocuous content
+```
+
+Once you have a working *multiple-device* (md), you can proceed to create
+cryptographic keys and LUKS headers.  This is done with the help of **keys** and
+**headers** commands.
+
+```
+> keys -h
+usage: keys [-h] {create,remove,list} ...
+
+Operate on cryptographic keys that are used to lock and unlock content of the plausibly-deniable environment.
+
+optional arguments:
+  -h, --help            show this help message and exit
+
+Keys Subcommands:
+  {create,remove,list}
+    create              create random cryptographic keys
+    remove              remove cryptographic keys
+    list                list cryptographic keys
+```
+
+and:
+```
+> headers -h
+usage: headers [-h] {create,remove,list} ...
+
+Operate on LUKS headers that are used to access the plausibly-deniable content.
+
+optional arguments:
+  -h, --help            show this help message and exit
+
+LUKS Header Subcommands:
+  {create,remove,list}
+    create              create random headers
+    remove              remove headers
+    list                list headers and associated information
+```
+
+**NOTE**: it is especially important to keep the output of the **headers**
+command in a safe place.  It contains the UUID name of the LUKS headers
+along with the UUID of the binary cryptographic keys, along with the
+offset into the key material, as well as the payload offset into the
+PDZ.
+
+After creating the headers, you need to designate one set of *header*, *key*,
+and *key-offset* as the true tuple that will unlock your PDZ content.
+
+You will then *bless* your PDZ via the **pde** *start* sub-command.
+
+```
+> pde start -h
+usage: pde start [-h] [--bless] --header HEADER --key KEY --offset OFFSET
+
+optional arguments:
+  -h, --help       show this help message and exit
+  --bless          create a fresh filesystem on the plausibly-deniable environment
+
+required arguments:
+  --header HEADER  header uuid
+  --key KEY        key uuid
+  --offset OFFSET  offset into cryptographic key
+```
+
+By *blessing* our PDZ, we are opening the *plausibly-deniable zone* with the tuple
+(header, key, key-offset) as well as creating a filesystem on it.  Since only
+you know this tuple, it will be extremely difficult for an adversary to determine
+the correct tuple via brute-force attacks.
 
 #### SPECIAL NOTES
